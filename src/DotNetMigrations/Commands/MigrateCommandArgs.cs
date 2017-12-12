@@ -14,5 +14,12 @@ namespace DotNetMigrations.Commands
         [Argument("version", "v", "Target version to migrate up or down to.",
             Position = 2)]
         public long TargetVersion { get; set; }
+
+        [ValueSetValidator("", "run", "script", ErrorMessage = "-scope must be 'run' or 'script'")]
+        [Argument("scope", "tx", "Transaction scope.",
+                    Position = 3)]
+        public string TransactionScope { get; set; }
+
+
     }
 }

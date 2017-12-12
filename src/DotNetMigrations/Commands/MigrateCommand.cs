@@ -44,17 +44,19 @@ namespace DotNetMigrations.Commands
         /// </summary>
         protected override void Execute(MigrateCommandArgs args)
         {
-            IOrderedEnumerable<IMigrationScriptFile> files = _migrationDirectory.GetScripts()
+            var files = _migrationDirectory.GetScripts()
                 .OrderByDescending(x => x.Version);
 
-            if (files.Count() == 0)
+            var oneScopePerScript = args.TransactionScope == "script";
+
+            if (!files.Any())
             {
                 Log.WriteLine("No migration scripts were found.");
                 return;
             }
 
-            long currentVersion = GetDatabaseVersion();
-            long targetVersion = args.TargetVersion;
+            var currentVersion = GetDatabaseVersion();
+            var targetVersion = args.TargetVersion;
 
             if (targetVersion == -1)
             {
@@ -68,13 +70,13 @@ namespace DotNetMigrations.Commands
             if (currentVersion < targetVersion)
             {
                 direction = MigrationDirection.Up;
-                MigrateUp(currentVersion, targetVersion, files);
+                MigrateUp(currentVersion, targetVersion, files, oneScopePerScript);
                 Log.WriteLine("Migrated up to version:".PadRight(30) + targetVersion);
             }
             else if (currentVersion > targetVersion)
             {
                 direction = MigrationDirection.Down;
-                MigrateDown(currentVersion, targetVersion, files);
+                MigrateDown(currentVersion, targetVersion, files, oneScopePerScript);
                 Log.WriteLine("Migrated down to version:".PadRight(30) + targetVersion);
             }
             else
@@ -111,13 +113,14 @@ namespace DotNetMigrations.Commands
         /// <param name="currentVersion">The current version of the database.</param>
         /// <param name="targetVersion">The targeted version of the database.</param>
         /// <param name="files">All migration script files.</param>
-        private void MigrateUp(long currentVersion, long targetVersion, IEnumerable<IMigrationScriptFile> files)
+        /// <param name="oneTransactionPerScript"></param>
+        private void MigrateUp(long currentVersion, long targetVersion, IEnumerable<IMigrationScriptFile> files, bool oneTransactionPerScript)
         {
-            IEnumerable<KeyValuePair<IMigrationScriptFile, string>> scripts = files.OrderBy(x => x.Version)
+            var scripts = files.OrderBy(x => x.Version)
                 .Where(x => x.Version > currentVersion && x.Version <= targetVersion)
                 .Select(x => new KeyValuePair<IMigrationScriptFile, string>(x, x.Read().Setup));
 
-            ExecuteMigrationScripts(scripts, UpdateSchemaVersionUp);
+            ExecuteMigrationScripts(scripts, UpdateSchemaVersionUp, oneTransactionPerScript);
         }
 
         /// <summary>
@@ -126,27 +129,79 @@ namespace DotNetMigrations.Commands
         /// <param name="currentVersion">The current version of the database.</param>
         /// <param name="targetVersion">The targeted version of the database.</param>
         /// <param name="files">All migration script files.</param>
-        private void MigrateDown(long currentVersion, long targetVersion, IEnumerable<IMigrationScriptFile> files)
+        /// <param name="oneTransactionPerScript"></param>
+        private void MigrateDown(long currentVersion, long targetVersion, IEnumerable<IMigrationScriptFile> files, bool oneTransactionPerScript)
         {
-            IEnumerable<KeyValuePair<IMigrationScriptFile, string>> scripts = files.OrderByDescending(x => x.Version)
+            var scripts = files.OrderByDescending(x => x.Version)
                 .Where(x => x.Version <= currentVersion && x.Version > targetVersion)
                 .Select(x => new KeyValuePair<IMigrationScriptFile, string>(x, x.Read().Teardown));
 
-            ExecuteMigrationScripts(scripts, UpdateSchemaVersionDown);
+            ExecuteMigrationScripts(scripts, UpdateSchemaVersionDown, oneTransactionPerScript);
         }
 
-        private void ExecuteMigrationScripts(IEnumerable<KeyValuePair<IMigrationScriptFile, string>> scripts, Action<DbTransaction, long> updateVersionAction)
+        private void ExecuteMigrationScripts(IEnumerable<KeyValuePair<IMigrationScriptFile, string>> scripts, Action<DbTransaction, long> updateVersionAction, bool oneTransactionPerScript)
         {
-            using (DbTransaction tran = Database.BeginTransaction())
+            if (oneTransactionPerScript)
+            {
+                OneTransactionPerScript(scripts, updateVersionAction);
+            }
+            else
+            {
+                SingleTransaction(scripts, updateVersionAction);
+            }
+        }
+
+        private void OneTransactionPerScript(IEnumerable<KeyValuePair<IMigrationScriptFile, string>> scripts, Action<DbTransaction, long> updateVersionAction)
+        {
+            Console.WriteLine("  Using One Transaction Per Script:");
+
+            foreach (var script in scripts)
+            {
+                using (var tran = Database.BeginTransaction())
+                {
+                    try
+                    {
+                        ExecuteScript(updateVersionAction, script, tran);
+
+                        tran.Commit();
+                    }
+                    catch (Exception ex)
+                    {
+                        tran.Rollback();
+
+                        var filePath = script.Key?.FilePath ?? "NULL";
+                        throw new MigrationException("Error executing migration script: " + filePath, filePath, ex);
+                    }
+                }
+            }
+        }
+
+        private string ExecuteScript(Action<DbTransaction, long> updateVersionAction, KeyValuePair<IMigrationScriptFile, string> script, DbTransaction tran)
+        {
+            var filePath = script.Key?.FilePath ?? "NULL";
+
+            Console.WriteLine(GetNow() + " - Start: " + filePath);
+
+            Database.ExecuteScript(tran, script.Value);
+            updateVersionAction(tran, script.Key.Version);
+
+            Console.WriteLine(GetNow() + " - End: " + filePath);
+            return filePath;
+        }
+
+        private void SingleTransaction(IEnumerable<KeyValuePair<IMigrationScriptFile, string>> scripts,
+            Action<DbTransaction, long> updateVersionAction)
+        {
+            Console.WriteLine("  Using SingleTransaction");
+
+            using (var tran = Database.BeginTransaction())
             {
                 IMigrationScriptFile currentScript = null;
                 try
                 {
                     foreach (var script in scripts)
                     {
-                        currentScript = script.Key;
-                        Database.ExecuteScript(tran, script.Value);
-                        updateVersionAction(tran, script.Key.Version);
+                        ExecuteScript(updateVersionAction, script, tran);
                     }
 
                     tran.Commit();
@@ -155,10 +210,15 @@ namespace DotNetMigrations.Commands
                 {
                     tran.Rollback();
 
-                    string filePath = (currentScript == null) ? "NULL" : currentScript.FilePath;
+                    var filePath = (currentScript == null) ? "NULL" : currentScript.FilePath;
                     throw new MigrationException("Error executing migration script: " + filePath, filePath, ex);
                 }
             }
+        }
+
+        private static string GetNow()
+        {
+            return DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
         }
 
         /// <summary>
@@ -169,7 +229,7 @@ namespace DotNetMigrations.Commands
         private static void UpdateSchemaVersionUp(DbTransaction transaction, long version)
         {
             const string sql = "INSERT INTO [schema_migrations] ([version]) VALUES ({0})";
-            using (DbCommand cmd = transaction.CreateCommand())
+            using (var cmd = transaction.CreateCommand())
             {
                 cmd.CommandText = string.Format(sql, version);
                 cmd.ExecuteNonQuery();
@@ -184,7 +244,7 @@ namespace DotNetMigrations.Commands
         private static void UpdateSchemaVersionDown(DbTransaction transaction, long version)
         {
             const string sql = "DELETE FROM [schema_migrations] WHERE version = {0}";
-            using (DbCommand cmd = transaction.CreateCommand())
+            using (var cmd = transaction.CreateCommand())
             {
                 cmd.CommandText = string.Format(sql, version);
                 cmd.ExecuteNonQuery();

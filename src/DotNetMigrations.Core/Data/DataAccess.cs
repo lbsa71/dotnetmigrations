@@ -89,8 +89,16 @@ namespace DotNetMigrations.Core.Data
                     cmd.CommandText = bakedBatch;
 
                     if (_commandTimeout.HasValue)
+                    {
                         cmd.CommandTimeout = _commandTimeout.Value;
-                    
+                    }
+
+                    var cmdCommandText = cmd.CommandText;
+
+                    var truncStr = cmdCommandText.Length > 15 ? cmdCommandText.Substring(0, 12) + "..." : cmdCommandText;
+
+                    Console.WriteLine("Executing :" + truncStr + " command timeout: " + cmd.CommandTimeout + "s conn timeout: " + cmd.Connection.ConnectionTimeout + "s.");
+
                     cmd.ExecuteNonQuery();
                 }
             }
